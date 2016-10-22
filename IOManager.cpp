@@ -1,4 +1,6 @@
 #include "Zookeeper.hpp"
+#include <boost/algorithm/string.hpp>
+using namespace boost::algorithm;
 
 list<string> parse_path(string path) {
 	list<string> vec;
@@ -175,7 +177,7 @@ void DirHandle::write(void *buf, uint32_t count, int64_t offset) {
 		cout << "Attempting to write " << count << " bytes to directory " << path << endl;
 		cout << "Offset " << hex << offset << endl;
 		cout << "Null write" << endl;
-		box->cpu->break_in = true;
+		break_in(true);
 	}
 }
 void DirHandle::ioctl(uint32_t code, void *ibuf, uint32_t isize, void *obuf, uint32_t osize) {

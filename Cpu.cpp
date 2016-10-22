@@ -20,9 +20,9 @@ void gdt_encode(uint8_t *gdt, int entry, uint32_t base, uint32_t limit, uint8_t 
     gdt[5] = type;
 }
 
-Cpu::Cpu(uint8_t *ram, uint8_t *kram) {
-	mem = ram;
-	kmem = kram;
+Cpu::Cpu() {
+	bailout(!(mem = (uint8_t *) valloc(RAM_SIZE)));
+	bailout(!(kmem = (uint8_t *) valloc(KRAM_SIZE)));
 
 	hv = new HVImpl();
 	memset(mem, 0, RAM_SIZE);
@@ -41,7 +41,7 @@ Cpu::Cpu(uint8_t *ram, uint8_t *kram) {
 	hv->reg(CR3, directory);
 	hv->reg(CR0, 0x80000000 | 0x20 | 0x01); // Paging | NE | PE
 
-	auto gdt = ram + 96*ONE_MB;
+	auto gdt = mem + 96*ONE_MB;
 	memset(gdt, 0, 0x10000);
 	gdt_encode(gdt, 0, 0, 0, 0); // Null entry
 	gdt_encode(gdt, 1, 0, 0xffffffff, 0x9A); // Code
@@ -53,6 +53,12 @@ Cpu::Cpu(uint8_t *ram, uint8_t *kram) {
 	hv->reg(CR4, 0x2000);
 }
 
+Cpu::~Cpu() {
+	delete hv;
+	delete[] mem;
+	delete[] kmem;
+}
+
 void Cpu::map_pages(uint32_t virt, uint32_t phys, uint32_t count, bool present) {
 	auto dir = (uint32_t *) (mem + 64*ONE_MB);
 	for(auto i = 0; i < count; ++i) {
@@ -62,18 +68,6 @@ void Cpu::map_pages(uint32_t virt, uint32_t phys, uint32_t count, bool present) 
 		phys += PAGE_SIZE;
 	}
 	hv->invalidate_tlb(); // Do we really need to do this all the time?
-}
-
-void Cpu::map_io(uint32_t base, uint32_t pages, MMIOReceiver *recv) {
-	auto memblock = new uint8_t[pages * PAGE_SIZE];
-	hv->map_phys(memblock, base, pages * PAGE_SIZE);
-	for(auto i = 0; i < pages; ++i) {
-		mmio[base] = recv;
-		recv->buffers[base] = memblock;
-		map_pages(base, base, 1, false); // Pages are not marked present
-		base += PAGE_SIZE;
-		memblock += PAGE_SIZE;
-	}
 }
 
 void Cpu::flip_page(uint32_t base, bool val) {
@@ -147,10 +141,6 @@ void Cpu::write_memory(uint32_t addr, uint32_t size, void *buffer) {
 	}
 }
 
-Cpu::~Cpu() {
-	delete hv;
-}
-
 #define TASK_TIMER 20 // Milliseconds
 #define TASK_INTERRUPT 80
 
@@ -160,20 +150,22 @@ uint64_t systime() {
 	return (time.tv_sec * 1000) + (time.tv_usec / 1000);
 }
 
-void Cpu::run(uint32_t eip) {
-	hv->reg(EIP, eip);
-	hv->reg(EFLAGS, 0x2);
+bool Cpu::run(uint32_t eip) {
+	if(eip != -1) {
+		hv->reg(EIP, eip);
+		hv->reg(EFLAGS, 0x2);
 
-	box->debugger->enter(0);
+		box->debugger->enter(0);
 
-	auto last_time = systime();
+		last_time = systime();
+	}
 
 	auto swap = true;
 	uint32_t in_mmio;
 	do {
-		if(break_in) {
+		if(do_break_in) {
 			box->debugger->enter();
-			break_in = false;
+			do_break_in = false;
 		}
 		auto exit = hv->enter();
 
@@ -213,11 +205,11 @@ void Cpu::run(uint32_t eip) {
 							case 4: { // MMIO Write
 								auto page = in_mmio & ~PAGE_MASK;
 								flip_page(page, false);
-								auto dev = mmio[page];
-								auto buf = dev->buffers[page];
+								auto dev = box->mmio[page];
+								auto buf = dev->mmioBuffers[page];
 								auto off = in_mmio & PAGE_MASK;
 								volatile auto val = (uint32_t *) ((uint8_t *) buf + off);
-								dev->write(in_mmio, *val);
+								dev->writeMmio(in_mmio, *val);
 								single_step = 0;
 								in_mmio = 0;
 								break;
@@ -233,10 +225,10 @@ void Cpu::run(uint32_t eip) {
 					}
 					case 14: {
 						auto page = exit.address & ~PAGE_MASK;
-						if(IN(page, mmio)) {
+						if(IN(page, box->mmio)) {
 							auto off = exit.address & PAGE_MASK;
-							auto dev = mmio[page];
-							auto buf = dev->buffers[page];
+							auto dev = box->mmio[page];
+							auto buf = dev->mmioBuffers[page];
 							auto write = FLAG(exit.error_code, 2);
 							in_mmio = exit.address;
 							flip_page(page, true);
@@ -244,7 +236,7 @@ void Cpu::run(uint32_t eip) {
 								single_step = 4;
 							} else {
 								volatile auto val = (uint32_t *) ((uint8_t *) buf + off);
-								*val = dev->read(exit.address);
+								*val = dev->readMmio(exit.address);
 								single_step = 3;
 							}
 						} else {
@@ -274,8 +266,30 @@ void Cpu::run(uint32_t eip) {
 				stop = true;
 				break;
 			case PortIO: {
-				hv->reg(EIP, hv->reg(EIP) + exit.instruction_length);
-				cout << "Port IO: " << hex << exit.port << endl;
+				if(IN(exit.port, box->ports)) {
+					auto dev = box->ports[exit.port];
+					if(exit.port_direction) {
+						auto val = hv->reg(EAX);
+						if(exit.port_size == 8)
+							val &= 0xFF;
+						else if(exit.port_size == 16)
+							val &= 0xFFFF;
+						dev->writePort(exit.port, exit.port_size, val);
+					}
+					else {
+						auto val = dev->readPort(exit.port, exit.port_size);
+						if(exit.port_size == 8)
+							hv->reg(EAX, (hv->reg(EAX) & 0xFFFFFF00) | (val & 0xFF));
+						else if(exit.port_size == 16)
+							hv->reg(EAX, (hv->reg(EAX) & 0xFFFF0000) | (val & 0xFFFF));
+						else
+							hv->reg(EAX, val);
+					}
+					hv->reg(EIP, hv->reg(EIP) + exit.instruction_length);
+				} else {
+					cout << "Unknown port: " << hex << exit.port << endl;
+					stop = true;
+				}
 				break;
 			}
 			case Ignore:
@@ -299,6 +313,10 @@ void Cpu::run(uint32_t eip) {
 				last_time = cur_time;
 			}
 		}
-	} while(!stop);
-	box->debugger->enter();
+	} while(!stop && !box->frame_rendered);
+	if(stop) { // No debugger on frame render
+		box->debugger->enter();
+		return false;
+	}
+	return true;
 }
